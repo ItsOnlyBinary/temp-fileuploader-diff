@@ -1,72 +1,104 @@
-// Package filestore provide a storage backend based on the local file system.
-//
-// FileStore is a storage backend used as a tusd.DataStore in tusd.NewHandler.
-// It stores the uploads in a directory specified in two different files: The
-// `[id].info` files are used to store the fileinfo in JSON format. The
-// `[id].bin` files contain the raw binary data uploaded.
-// No cleanup is performed so you may want to run a cronjob to ensure your disk
-// is not filled up with old and finished uploads.
-//
-// In addition, it provides an exclusive upload locking mechanism using lock files
-// which are stored on disk. Each of them stores the PID of the process which
-// acquired the lock. This allows locks to be automatically freed when a process
-// is unable to release it on its own because the process is not alive anymore.
-// For more information, consult the documentation for tusd.LockerDataStore
-// interface, which is implemented by FileStore
-package filestore
+// Package shardedfilestore is a modified version of the tusd/filestore implementation.
+// Splits file storage into subdirectories based on the hash prefix.
+// based on https://github.com/tus/tusd/blob/966f1d51639d3405b630e4c94c0b1d76a0f7475c/filestore/filestore.go
+package shardedfilestore
 
 import (
+	"crypto/sha256"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"strings"
+	"time"
+
+	_ "github.com/go-sql-driver/mysql" // register mysql driver
+	"github.com/kiwiirc/plugin-fileuploader/db"
+	_ "github.com/mattn/go-sqlite3" // register SQL driver
+	"github.com/rs/zerolog"
+	lockfile "gopkg.in/Acconut/lockfile.v1"
 
 	"github.com/tus/tusd"
 	"github.com/tus/tusd/uid"
-
-	"gopkg.in/Acconut/lockfile.v1"
 )
 
 var defaultFilePerm = os.FileMode(0664)
+var defaultDirectoryPerm = os.FileMode(0775)
 
-// See the tusd.DataStore interface for documentation about the different
-// methods.
-type FileStore struct {
-	// Relative or absolute path to store files in. FileStore does not check
-	// whether the path exists, use os.MkdirAll in this case on your own.
-	Path string
+// ShardedFileStore implements various tusd.DataStore-related interfaces.
+// See the interfaces for more documentation about the different methods.
+type ShardedFileStore struct {
+	BasePath          string // Relative or absolute path to store files in.
+	PrefixShardLayers int    // Number of extra directory layers to prefix file paths with.
+	DBConn            *db.DatabaseConnection
+	log               *zerolog.Logger
 }
 
 // New creates a new file based storage backend. The directory specified will
 // be used as the only storage entry. This method does not check
 // whether the path exists, use os.MkdirAll to ensure.
 // In addition, a locking mechanism is provided.
-func New(path string) FileStore {
-	return FileStore{path}
+func New(basePath string, prefixShardLayers int, dbConnection *db.DatabaseConnection, log *zerolog.Logger) *ShardedFileStore {
+
+	store := &ShardedFileStore{
+		BasePath:          basePath,
+		PrefixShardLayers: prefixShardLayers,
+		DBConn:            dbConnection,
+		log:               log,
+	}
+	store.initDB()
+	return store
+}
+
+// Close frees the database connection pool held within ShardedFileStore
+func (store *ShardedFileStore) Close() error {
+	return store.DBConn.DB.Close()
 }
 
 // UseIn sets this store as the core data store in the passed composer and adds
 // all possible extension to it.
-func (store FileStore) UseIn(composer *tusd.StoreComposer) {
+func (store *ShardedFileStore) UseIn(composer *tusd.StoreComposer) {
 	composer.UseCore(store)
 	composer.UseGetReader(store)
 	composer.UseTerminater(store)
 	composer.UseLocker(store)
 	composer.UseConcater(store)
+	composer.UseFinisher(store)
 }
 
-func (store FileStore) NewUpload(info tusd.FileInfo) (id string, err error) {
+func (store *ShardedFileStore) NewUpload(info tusd.FileInfo) (id string, err error) {
 	id = uid.Uid()
 	info.ID = id
+
+	// Create the directory stucture if needed
+	err = os.MkdirAll(store.metaDir(id), defaultDirectoryPerm)
+	if err != nil {
+		return "", err
+	}
+	err = os.MkdirAll(store.incompleteBinDir(), defaultDirectoryPerm)
+	if err != nil {
+		return "", err
+	}
+
+	// create record in uploads table
+	if info.MetaData["account"] == "" {
+		err = db.UpdateRow(store.DBConn.DB, `INSERT INTO uploads(id, created_at) VALUES (?, ?)`, id, time.Now().Unix())
+	} else {
+		err = db.UpdateRow(store.DBConn.DB,
+			`INSERT INTO uploads(id, created_at, jwt_account, jwt_issuer) VALUES (?, ?, ?, ?)`,
+			id, time.Now().Unix(), info.MetaData["account"], info.MetaData["issuer"],
+		)
+	}
+	if err != nil {
+		return "", err
+	}
 
 	// Create .bin file with no content
 	file, err := os.OpenFile(store.binPath(id), os.O_CREATE|os.O_WRONLY, defaultFilePerm)
 	if err != nil {
-		if os.IsNotExist(err) {
-			err = fmt.Errorf("upload directory does not exist: %s", store.Path)
-		}
 		return "", err
 	}
 	defer file.Close()
@@ -76,7 +108,7 @@ func (store FileStore) NewUpload(info tusd.FileInfo) (id string, err error) {
 	return
 }
 
-func (store FileStore) WriteChunk(id string, offset int64, src io.Reader) (int64, error) {
+func (store *ShardedFileStore) WriteChunk(id string, offset int64, src io.Reader) (int64, error) {
 	file, err := os.OpenFile(store.binPath(id), os.O_WRONLY|os.O_APPEND, defaultFilePerm)
 	if err != nil {
 		return 0, err
@@ -87,7 +119,7 @@ func (store FileStore) WriteChunk(id string, offset int64, src io.Reader) (int64
 	return n, err
 }
 
-func (store FileStore) GetInfo(id string) (tusd.FileInfo, error) {
+func (store *ShardedFileStore) GetInfo(id string) (tusd.FileInfo, error) {
 	info := tusd.FileInfo{}
 	data, err := ioutil.ReadFile(store.infoPath(id))
 	if err != nil {
@@ -107,21 +139,48 @@ func (store FileStore) GetInfo(id string) (tusd.FileInfo, error) {
 	return info, nil
 }
 
-func (store FileStore) GetReader(id string) (io.Reader, error) {
+func (store *ShardedFileStore) GetReader(id string) (io.Reader, error) {
 	return os.Open(store.binPath(id))
 }
 
-func (store FileStore) Terminate(id string) error {
-	if err := os.Remove(store.infoPath(id)); err != nil {
+func (store *ShardedFileStore) Terminate(id string) error {
+	duplicates, err := store.getDuplicateCount(id)
+	if err != nil {
 		return err
 	}
-	if err := os.Remove(store.binPath(id)); err != nil {
+
+	binPath := store.binPath(id)
+
+	// remove upload .info file
+	if err := RemoveWithDirs(store.infoPath(id), store.BasePath); err != nil {
 		return err
 	}
+
+	// delete .bin if there are no other upload records using it
+	if duplicates == 0 {
+		if err := RemoveWithDirs(binPath, store.BasePath); err != nil {
+			return err
+		}
+		store.log.Info().
+			Str("event", "blob_deleted").
+			Str("binPath", binPath).
+			Msg("Removed upload bin")
+	}
+
+	// mark upload db record as deleted
+	err = db.UpdateRow(store.DBConn.DB, `
+		UPDATE uploads
+		SET deleted = 1
+		WHERE id = ?
+	`, id)
+	if err != nil {
+		return err
+	}
+
 	return nil
 }
 
-func (store FileStore) ConcatUploads(dest string, uploads []string) (err error) {
+func (store *ShardedFileStore) ConcatUploads(dest string, uploads []string) (err error) {
 	file, err := os.OpenFile(store.binPath(dest), os.O_WRONLY|os.O_APPEND, defaultFilePerm)
 	if err != nil {
 		return err
@@ -142,7 +201,7 @@ func (store FileStore) ConcatUploads(dest string, uploads []string) (err error) 
 	return
 }
 
-func (store FileStore) LockUpload(id string) error {
+func (store *ShardedFileStore) LockUpload(id string) error {
 	lock, err := store.newLock(id)
 	if err != nil {
 		return err
@@ -156,7 +215,7 @@ func (store FileStore) LockUpload(id string) error {
 	return err
 }
 
-func (store FileStore) UnlockUpload(id string) error {
+func (store *ShardedFileStore) UnlockUpload(id string) error {
 	lock, err := store.newLock(id)
 	if err != nil {
 		return err
@@ -175,8 +234,8 @@ func (store FileStore) UnlockUpload(id string) error {
 }
 
 // newLock contructs a new Lockfile instance.
-func (store FileStore) newLock(id string) (lockfile.Lockfile, error) {
-	path, err := filepath.Abs(filepath.Join(store.Path, id+".lock"))
+func (store *ShardedFileStore) newLock(id string) (lockfile.Lockfile, error) {
+	path, err := filepath.Abs(store.lockPath(id))
 	if err != nil {
 		return lockfile.Lockfile(""), err
 	}
@@ -188,20 +247,228 @@ func (store FileStore) newLock(id string) (lockfile.Lockfile, error) {
 }
 
 // binPath returns the path to the .bin storing the binary data.
-func (store FileStore) binPath(id string) string {
-	return filepath.Join(store.Path, id+".bin")
+func (store *ShardedFileStore) binPath(id string) string {
+	hashBytes, isFinal, err := store.lookupHash(id)
+	if err != nil {
+		store.log.Fatal().Err(err).Msg("Could not look up hash")
+	}
+
+	if !isFinal {
+		return store.incompleteBinPath(id)
+	}
+
+	return store.completeBinPath(hashBytes)
 }
 
-// infoPath returns the path to the .info file storing the file's info.
-func (store FileStore) infoPath(id string) string {
-	return filepath.Join(store.Path, id+".info")
+// infoPath returns the path to the .info file storing the upload's metadata.
+func (store *ShardedFileStore) infoPath(id string) string {
+	// <base-path>/meta/<id-shards>/<id>.info
+	return filepath.Join(store.metaDir(id), id+".info")
 }
 
 // writeInfo updates the entire information. Everything will be overwritten.
-func (store FileStore) writeInfo(id string, info tusd.FileInfo) error {
+func (store *ShardedFileStore) writeInfo(id string, info tusd.FileInfo) error {
 	data, err := json.Marshal(info)
 	if err != nil {
 		return err
 	}
 	return ioutil.WriteFile(store.infoPath(id), data, defaultFilePerm)
+}
+
+
+// ADDED FUNCTIONS
+
+// FinishUpload deduplicates the upload by its cryptographic hash
+func (store *ShardedFileStore) FinishUpload(id string) error {
+	store.log.Debug().
+		Str("event", "upload_finished").
+		Str("id", id).Msg("Finishing upload")
+
+	// calculate hash
+	hash, err := store.hashFile(id)
+	if err != nil {
+		return err
+	}
+
+	// update hash in uploads table
+	err = db.UpdateRow(store.DBConn.DB, `
+		UPDATE uploads
+		SET sha256sum = ?
+		WHERE id = ?
+	`, hash, id)
+	if err != nil {
+		return err
+	}
+
+	// relocate file
+	newPath := store.completeBinPath(hash)
+	os.MkdirAll(filepath.Dir(newPath), defaultDirectoryPerm)
+	oldPath := store.incompleteBinPath(id)
+	err = os.Rename(oldPath, newPath)
+	if err != nil {
+		store.log.Error().
+			Err(err).
+			Str("oldPath", oldPath).
+			Str("newPath", newPath).
+			Msg("Failed to rename")
+	}
+	return err
+}
+
+func (store *ShardedFileStore) hashFile(id string) ([]byte, error) {
+	f, err := os.Open(store.binPath(id))
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return nil, err
+	}
+
+	return h.Sum(nil), nil
+}
+
+func isDirEmpty(path string) (bool, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+
+	_, err = f.Readdirnames(1)
+    if err == io.EOF {
+        return true, nil
+    }
+    return false, err
+}
+
+func (store *ShardedFileStore) getDuplicateCount(id string) (duplicates int, err error) {
+	// fetch hash
+	hash, _, err := store.lookupHash(id)
+	if err != nil {
+		return
+	}
+
+	// check if there are any other uploads pointing to this file
+	err = store.DBConn.DB.QueryRow(`
+		SELECT count(id)
+		FROM uploads
+		WHERE
+			sha256sum = ? AND
+			id != ? AND
+			deleted = 0
+	`, hash, id).Scan(&duplicates)
+
+	return
+}
+
+// RemoveWithDirs deletes the given path and its empty parent directories
+// up to the given basePath
+func RemoveWithDirs(path string, basePath string) (err error) {
+	absBase, err := filepath.Abs(basePath)
+	if err != nil {
+		return
+	}
+
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return
+	}
+
+	if !strings.HasPrefix(absPath, absBase) {
+		return fmt.Errorf("Path %#v is not prefixed by basepath %#v", path, basePath)
+	}
+
+	if _, err := os.Stat(path); err == nil {
+		err = os.Remove(path)
+	} else if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	parent := path
+	for {
+		parent = filepath.Dir(parent)
+		parentAbs, err := filepath.Abs(parent)
+		if err != nil {
+			return err
+		}
+		if !strings.HasPrefix(parentAbs, absBase) || parentAbs == absBase {
+			return err
+		}
+
+		empty, err := isDirEmpty(parent);
+		if empty {
+			err = os.Remove(parent)
+		}
+		if err != nil {
+			return err
+		}
+	}
+}
+// lookupHash translates a randomly generated upload id into its cryptographic
+// hash by querying the upload database.
+func (store *ShardedFileStore) lookupHash(id string) (hash []byte, isFinal bool, err error) {
+	row := store.DBConn.DB.QueryRow(`SELECT sha256sum FROM uploads WHERE id = ?`, id)
+	err = row.Scan(&hash)
+
+	// no finalized upload exists
+	if err == sql.ErrNoRows {
+		isFinal = false
+		err = nil
+		return
+	}
+
+	// something went wrong!
+	if err != nil {
+		return
+	}
+
+	isFinal = hash != nil
+	return
+}
+
+// metaDir returns the directory that the info and lock files reside in for a given id
+func (store *ShardedFileStore) metaDir(id string) string {
+	// <base-path>/meta/<id-shards>
+	shards := store.shards(id)
+	return filepath.Join(store.BasePath, "meta", shards)
+}
+
+// lockPath returns the path to the .lock file for an upload id
+func (store *ShardedFileStore) lockPath(id string) string {
+	// <base-path>/meta/<id-shards>/<id>.lock
+	return filepath.Join(store.metaDir(id), id+".lock")
+}
+
+// generates a directory hierarchy
+func (store *ShardedFileStore) shards(id string) string {
+	if len(id) < store.PrefixShardLayers {
+		panic("id is too short for requested number of shard layers")
+	}
+	shards := make([]string, store.PrefixShardLayers)
+	for n, char := range id[:store.PrefixShardLayers] {
+		shards[n] = string(char)
+	}
+	return filepath.Join(shards...)
+}
+
+func (store *ShardedFileStore) incompleteBinDir() string {
+	return filepath.Join(store.BasePath, "incomplete")
+}
+
+func (store *ShardedFileStore) incompleteBinPath(id string) string {
+	// during upload: <base-path>/incomplete/<id>.bin
+	return filepath.Join(store.incompleteBinDir(), id+".bin")
+}
+
+func (store ShardedFileStore) completeBinPath(hashBytes []byte) string {
+	// finished: <base-path>/complete/<hash-shards>/<hash>.bin
+	hash := fmt.Sprintf("%x", hashBytes)
+	shards := store.shards(hash)
+	return filepath.Join(store.BasePath, "complete", shards, hash+".bin")
 }
